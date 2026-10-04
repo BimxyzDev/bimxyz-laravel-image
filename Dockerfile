@@ -1,4 +1,4 @@
-# Bimxyz Official - Laravel (Nginx + PHP-FPM) untuk Pterodactyl
+# Bimxyz Official - PHP web hosting (Nginx + PHP-FPM, Laravel & PHP umum) untuk Pterodactyl
 # Basis: image PHP resmi (php:<versi>-fpm-alpine). Nginx dari repo Alpine, Composer dari image resmi composer.
 #
 # Build:  docker build --build-arg PHP_VERSION=8.4 -t bimxyz-laravel:8.4 .
@@ -7,7 +7,7 @@ FROM php:${PHP_VERSION}-fpm-alpine
 
 # Paket runtime (repo resmi Alpine) + library untuk ekstensi PHP
 RUN apk add --no-cache \
-        nginx tini git curl unzip tzdata iproute2 \
+        nginx tini bash git curl unzip tzdata iproute2 \
         libzip icu-libs libpng libjpeg-turbo freetype
 
 # Ekstensi PHP lewat helper resmi docker-php-ext-*
@@ -32,7 +32,7 @@ RUN sed -i 's/\r$//' /entrypoint.sh /usr/local/bin/bimxyz-start \
 
 # Cek kelengkapan saat build: kalau ada yang hilang, build langsung gagal di sini (bukan saat server start)
 RUN set -eux; \
-    php -v; php-fpm -v; nginx -v; composer --version; git --version; \
+    php -v; php-fpm -v; nginx -v; composer --version; git --version; bash --version | head -n 1; \
     php -r 'foreach (["pdo_mysql","mysqli","gd","zip","intl","bcmath","mbstring","openssl","tokenizer","xml","ctype","fileinfo","curl","pcntl","exif","Zend OPcache"] as $e) { if (!extension_loaded($e)) { fwrite(STDERR, "extension hilang: $e\n"); exit(1); } }'; \
     test -x /sbin/tini
 

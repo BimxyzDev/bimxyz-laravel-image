@@ -1,72 +1,96 @@
-#!/bin/ash
-# Bimxyz Official - Laravel launcher (Nginx + PHP-FPM).
-# Semua konfigurasi dibuat di sini setiap start. Tidak ada unduhan dari pihak ketiga.
+#!/bin/bash
+# Bimxyz Official - PHP web launcher (Nginx + PHP-FPM), untuk PHP biasa maupun Laravel.
+#
+# Aturan utama: SERVER TIDAK PERNAH BERHENTI sendiri. Tidak ada "exit" kecuali saat server di-stop.
+# Semua error hanya dicetak ke console, lalu server tetap lanjut (dan console tetap bisa dipakai).
 # Root filesystem container read-only: semua yang ditulis ada di /home/container.
-set -eu
 
 H=/home/container
-cd "$H"
+cd "$H" 2>/dev/null || true
+exec 4<&0
 
-log()  { echo "[Bimxyz] $1"; }
-warn() { echo "[Bimxyz][WARNING] $1"; }
-fail() { echo "[Bimxyz][ERROR] $1"; exit 1; }
+log()  { echo "[Bimxyz] $*"; }
+warn() { echo "[Bimxyz][WARNING] $*"; }
+err()  { echo "[Bimxyz][ERROR] $*"; }
 
 show_logs() {
-    for f in php-fpm.log php-fpm.out nginx-error.log nginx.out; do
+    local f
+    for f in php-fpm.log php-fpm.out nginx-error.log nginx.out builtin.out; do
         if [ -s "$H/logs/$f" ]; then
             echo "--- logs/$f (tail) ---"
-            tail -n 15 "$H/logs/$f"
+            tail -n 10 "$H/logs/$f"
         fi
     done
+    return 0
 }
 
+FPM_PID=""; WEB_PID=""; QUEUE_PID=""; SCHED_PID=""; CF_PID=""; SH_PID=""; FWD_PID=""; RESET_REQ=0
+
+cleanup() {
+    local p
+    for p in "$FWD_PID" "$QUEUE_PID" "$SCHED_PID" "$CF_PID" "$WEB_PID" "$FPM_PID" "$SH_PID"; do
+        if [ -n "$p" ]; then
+            pkill -TERM -P "$p" 2>/dev/null
+            kill -TERM "$p" 2>/dev/null
+        fi
+    done
+    return 0
+}
+trap 'exit 0' INT TERM
+trap 'RESET_REQ=1' USR1
+trap cleanup EXIT
+
 # ---------------------------------------------------------------- binaries
-PHP_BIN="$(command -v php 2>/dev/null || true)"
-[ -n "$PHP_BIN" ] || fail "php not found in the image."
-FPM_BIN="$(command -v php-fpm 2>/dev/null || true)"
-[ -n "$FPM_BIN" ] || fail "php-fpm not found in the image."
-NGINX_BIN="$(command -v nginx 2>/dev/null || true)"
-[ -n "$NGINX_BIN" ] || fail "nginx not found in the image."
-COMPOSER_BIN="$(command -v composer 2>/dev/null || true)"
-[ -n "$COMPOSER_BIN" ] || fail "composer not found in the image."
+PHP_BIN="$(command -v php 2>/dev/null)"
+FPM_BIN="$(command -v php-fpm 2>/dev/null)"
+NGINX_BIN="$(command -v nginx 2>/dev/null)"
+COMPOSER_BIN="$(command -v composer 2>/dev/null)"
 export COMPOSER_MEMORY_LIMIT=-1
 
-# ---------------------------------------------------------------- validasi env
+WEB_OK=1
+[ -n "$PHP_BIN" ]   || { err "php tidak ditemukan di image. Web server tidak dijalankan."; WEB_OK=0; }
+[ -n "$FPM_BIN" ]   || warn "php-fpm tidak ditemukan; memakai server bawaan PHP."
+[ -n "$NGINX_BIN" ] || warn "nginx tidak ditemukan; memakai server bawaan PHP."
+
+# ---------------------------------------------------------------- validasi env (selalu ada fallback)
 PORT="${SERVER_PORT:-}"
 case "$PORT" in
-    ''|*[!0-9]*) fail "SERVER_PORT is missing or not numeric." ;;
+    ''|*[!0-9]*) err "SERVER_PORT kosong atau bukan angka. Web server tidak dijalankan."; WEB_OK=0 ;;
 esac
 
 FPM_CHILDREN="${PHP_FPM_MAX_CHILDREN:-5}"
 case "$FPM_CHILDREN" in
-    ''|*[!0-9]*) fail "PHP_FPM_MAX_CHILDREN must be an integer." ;;
+    ''|*[!0-9]*) warn "PHP_FPM_MAX_CHILDREN tidak valid, memakai 5."; FPM_CHILDREN=5 ;;
 esac
-[ "$FPM_CHILDREN" -ge 1 ] || fail "PHP_FPM_MAX_CHILDREN must be >= 1."
-[ "$FPM_CHILDREN" -le 100 ] || fail "PHP_FPM_MAX_CHILDREN must be <= 100."
-FPM_START=2
-FPM_MIN_SPARE=1
-FPM_MAX_SPARE=3
+[ "$FPM_CHILDREN" -ge 1 ]   || FPM_CHILDREN=1
+[ "$FPM_CHILDREN" -le 100 ] || FPM_CHILDREN=100
+FPM_START=2; FPM_MIN_SPARE=1; FPM_MAX_SPARE=3
 [ "$FPM_CHILDREN" -lt 2 ] && FPM_START="$FPM_CHILDREN"
 [ "$FPM_CHILDREN" -lt 3 ] && FPM_MAX_SPARE="$FPM_CHILDREN"
 
 POST_MAX="${PHP_POST_MAX_SIZE:-100M}"
-echo "$POST_MAX" | grep -Eq '^[0-9]+[KMGkmg]?$' || fail "PHP_POST_MAX_SIZE must look like 100M."
+if ! echo "$POST_MAX" | grep -Eq '^[0-9]+[KMGkmg]?$'; then
+    warn "PHP_POST_MAX_SIZE tidak valid, memakai 100M."
+    POST_MAX=100M
+fi
 
-log "Using $("$PHP_BIN" -v 2>/dev/null | head -n 1)"
+[ -n "$PHP_BIN" ] && log "Using $("$PHP_BIN" -v 2>/dev/null | head -n 1)"
 
 # ---------------------------------------------------------------- folder kerja
-mkdir -p "$H/webroot" "$H/logs" "$H/nginx" "$H/php-fpm" "$H/php/conf.d" \
+WEBROOT="$H/webroot"
+mkdir -p "$WEBROOT" "$H/logs" "$H/nginx" "$H/php-fpm" "$H/php/conf.d" \
          "$H/tmp/sessions" "$H/tmp/nginx/body" "$H/tmp/nginx/proxy" \
-         "$H/tmp/nginx/fastcgi" "$H/tmp/nginx/uwsgi" "$H/tmp/nginx/scgi"
+         "$H/tmp/nginx/fastcgi" "$H/tmp/nginx/uwsgi" "$H/tmp/nginx/scgi" 2>/dev/null
 rm -f "$H/tmp/php-fpm.sock" "$H/tmp/php-fpm.pid" "$H/tmp/nginx.pid"
 
 # ---------------------------------------------------------------- PHP ini
-# Folder ini bawaan image tetap dibaca; ini tambahan ada di /home/container/php/conf.d
-DEFSCAN="$("$PHP_BIN" --ini 2>/dev/null | sed -n 's/^Scan for additional .ini files in: //p' | sed 's/[[:space:]]*$//')"
-case "$DEFSCAN" in
-    ''|'(none)') DEFSCAN="/usr/local/etc/php/conf.d" ;;
-esac
-export PHP_INI_SCAN_DIR="$DEFSCAN:$H/php/conf.d"
+if [ -n "$PHP_BIN" ]; then
+    DEFSCAN="$("$PHP_BIN" --ini 2>/dev/null | sed -n 's/^Scan for additional .ini files in: //p' | sed 's/[[:space:]]*$//')"
+    case "$DEFSCAN" in
+        ''|'(none)') DEFSCAN="/usr/local/etc/php/conf.d" ;;
+    esac
+    export PHP_INI_SCAN_DIR="$DEFSCAN:$H/php/conf.d"
+fi
 
 cat > "$H/php/conf.d/99-bimxyz.ini" <<EOF_PHP
 expose_php=Off
@@ -84,7 +108,7 @@ realpath_cache_size=4096K
 realpath_cache_ttl=600
 EOF_PHP
 
-if [ "${OPCACHE_STATUS:-1}" = "1" ] && "$PHP_BIN" -m 2>/dev/null | grep -qi '^Zend OPcache$'; then
+if [ -n "$PHP_BIN" ] && [ "${OPCACHE_STATUS:-1}" = "1" ] && "$PHP_BIN" -m 2>/dev/null | grep -qi '^Zend OPcache$'; then
     cat >> "$H/php/conf.d/99-bimxyz.ini" <<EOF_OPCACHE
 opcache.enable=1
 opcache.enable_cli=0
@@ -119,6 +143,154 @@ php_admin_value[error_log] = $H/logs/php-error.log
 php_admin_flag[log_errors] = on
 EOF_FPM
 
+# ---------------------------------------------------------------- Git (opsional, tidak fatal)
+if [ -n "${GIT_ADDRESS:-}" ]; then
+    GIT_URL="${GIT_ADDRESS}"
+    case "$GIT_URL" in *.git) ;; *) GIT_URL="${GIT_URL}.git" ;; esac
+    ASKPASS="$H/.git-askpass"
+    if [ -n "${GIT_USERNAME:-}" ] || [ -n "${GIT_ACCESS_TOKEN:-}" ]; then
+        cat > "$ASKPASS" <<'EOF_ASKPASS'
+#!/bin/ash
+case "$1" in
+    *Username*) printf '%s\n' "${GIT_USERNAME:-}" ;;
+    *) printf '%s\n' "${GIT_ACCESS_TOKEN:-}" ;;
+esac
+EOF_ASKPASS
+        chmod 0700 "$ASKPASS"
+        export GIT_ASKPASS="$ASKPASS"
+        export GIT_TERMINAL_PROMPT=0
+    fi
+
+    if [ -d "$WEBROOT/.git" ]; then
+        if [ "${GIT_AUTO_PULL:-0}" = "1" ]; then
+            log "Git auto-pull enabled (ff-only)."
+            git -C "$WEBROOT" pull --ff-only || warn "Git auto-pull gagal (lanjut dengan file yang ada)."
+        fi
+    elif [ -z "$(ls -A "$WEBROOT" 2>/dev/null)" ]; then
+        log "Cloning repository..."
+        if [ -n "${GIT_BRANCH:-}" ]; then
+            git clone --depth 1 --single-branch --branch "$GIT_BRANCH" "$GIT_URL" "$WEBROOT" || warn "Git clone gagal."
+        else
+            git clone --depth 1 "$GIT_URL" "$WEBROOT" || warn "Git clone gagal."
+        fi
+    else
+        warn "webroot sudah berisi file dan bukan repo Git; clone dilewati."
+    fi
+    rm -f "$ASKPASS"
+fi
+
+# ---------------------------------------------------------------- halaman bawaan kalau webroot kosong
+if [ -z "$(ls -A "$WEBROOT" 2>/dev/null)" ]; then
+    cat > "$WEBROOT/index.php" <<'EOF_INDEX'
+<?php
+header('Content-Type: text/html; charset=utf-8');
+?><!doctype html>
+<html lang="id"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Server PHP aktif</title>
+<style>body{font-family:system-ui,sans-serif;background:#0d1117;color:#e6edf3;display:flex;min-height:100vh;align-items:center;justify-content:center;margin:0}
+.c{max-width:520px;padding:24px}h1{font-size:22px}code{background:#21262d;padding:2px 6px;border-radius:4px}</style></head>
+<body><div class="c"><h1>Server PHP aktif</h1>
+<p>PHP <?php echo htmlspecialchars(PHP_VERSION, ENT_QUOTES, 'UTF-8'); ?> berjalan normal.</p>
+<p>Upload file website kamu ke folder <code>webroot</code> lewat File Manager, lalu refresh halaman ini.</p></div></body></html>
+EOF_INDEX
+    log "webroot kosong: membuat halaman bawaan index.php."
+fi
+
+# ---------------------------------------------------------------- tentukan document root
+DOCROOT="$WEBROOT"
+IS_LARAVEL=0
+[ -f "$WEBROOT/artisan" ] && IS_LARAVEL=1
+
+CUSTOM_ROOT="${DOCUMENT_ROOT_DIR:-}"
+CUSTOM_ROOT="${CUSTOM_ROOT#/}"
+CUSTOM_ROOT="${CUSTOM_ROOT%/}"
+if [ -n "$CUSTOM_ROOT" ]; then
+    if echo "$CUSTOM_ROOT" | grep -Eq '^[A-Za-z0-9_./-]+$' && [ "${CUSTOM_ROOT#*..}" = "$CUSTOM_ROOT" ] && [ -d "$WEBROOT/$CUSTOM_ROOT" ]; then
+        DOCROOT="$WEBROOT/$CUSTOM_ROOT"
+    else
+        warn "DOCUMENT_ROOT_DIR '$CUSTOM_ROOT' tidak valid atau tidak ada; memakai pilihan otomatis."
+        CUSTOM_ROOT=""
+    fi
+fi
+if [ -z "$CUSTOM_ROOT" ] && [ "$IS_LARAVEL" = "1" ] && [ -d "$WEBROOT/public" ]; then
+    DOCROOT="$WEBROOT/public"
+fi
+if [ "$IS_LARAVEL" = "1" ]; then
+    log "Mode: Laravel (document root: ${DOCROOT#$H/})"
+else
+    log "Mode: PHP umum (document root: ${DOCROOT#$H/})"
+fi
+
+# ---------------------------------------------------------------- Composer (PHP umum & Laravel, tidak fatal)
+run_composer() {
+    [ -n "$PHP_BIN" ] && [ -n "$COMPOSER_BIN" ] || return 0
+    [ "${COMPOSER_AUTO_INSTALL:-1}" = "1" ] && [ -f "$WEBROOT/composer.json" ] || return 0
+    cd "$WEBROOT" || return 0
+    local mode="${COMPOSER_MODE:-install}" nodev=""
+    [ "${COMPOSER_NO_DEV:-1}" = "1" ] && nodev="--no-dev"
+    case "$mode" in
+        none) ;;
+        update)
+            log "Running Composer update (explicitly requested)."
+            "$PHP_BIN" "$COMPOSER_BIN" update --no-interaction --prefer-dist $nodev --optimize-autoloader || warn "Composer update gagal."
+            ;;
+        *)
+            [ "$mode" = "install" ] || warn "COMPOSER_MODE '$mode' tidak dikenal, memakai install."
+            if [ "${COMPOSER_FORCE_INSTALL:-0}" = "1" ] || [ ! -f vendor/autoload.php ]; then
+                log "Running Composer install."
+                "$PHP_BIN" "$COMPOSER_BIN" install --no-interaction --prefer-dist $nodev --optimize-autoloader || warn "Composer install gagal."
+            fi
+            ;;
+    esac
+    if [ -n "${COMPOSER_EXTRA_PACKAGES:-}" ] && [ "${COMPOSER_EXTRA_ON_START:-0}" = "1" ]; then
+        log "Installing extra Composer packages."
+        # tanpa tanda kutip: beberapa paket (dipisah spasi) terbaca satu per satu
+        "$PHP_BIN" "$COMPOSER_BIN" require ${COMPOSER_EXTRA_PACKAGES} --no-interaction || warn "Composer require gagal."
+    fi
+    return 0
+}
+
+# ---------------------------------------------------------------- Laravel bootstrap (hanya kalau ada artisan, tidak fatal)
+run_laravel() {
+    [ "$IS_LARAVEL" = "1" ] && [ -n "$PHP_BIN" ] || return 0
+    cd "$WEBROOT" || return 0
+
+    if [ "${CREATE_ENV_FILE:-1}" = "1" ] && [ ! -f .env ] && [ -f .env.example ]; then
+        log "Creating .env from .env.example."
+        cp .env.example .env
+    fi
+
+    if [ ! -f vendor/autoload.php ]; then
+        warn "vendor/autoload.php tidak ada; langkah artisan dilewati. Upload folder vendor/ atau aktifkan Composer."
+        return 0
+    fi
+
+    if [ "${GENERATE_APP_KEY:-1}" = "1" ] && [ -f .env ]; then
+        local key
+        key="$(grep -E '^APP_KEY=' .env | head -n 1 | cut -d= -f2-)"
+        if [ -z "$key" ]; then
+            log "Generating Laravel APP_KEY."
+            "$PHP_BIN" artisan key:generate --force || warn "APP_KEY generation gagal."
+        fi
+    fi
+
+    mkdir -p storage/framework/cache storage/framework/sessions storage/framework/views storage/logs bootstrap/cache
+    chmod -R ug+rwX storage bootstrap/cache 2>/dev/null
+
+    [ "${RUN_STORAGE_LINK:-1}" = "1" ] && { "$PHP_BIN" artisan storage:link --force || warn "storage:link gagal."; }
+    if [ "${RUN_MIGRATIONS:-0}" = "1" ]; then
+        log "Running database migrations."
+        "$PHP_BIN" artisan migrate --force || warn "Migrasi database gagal."
+    fi
+    [ "${RUN_OPTIMIZE:-1}" = "1" ] && { "$PHP_BIN" artisan optimize || warn "Laravel optimize gagal."; }
+    [ "${CLEAR_CACHES:-0}" = "1" ] && { "$PHP_BIN" artisan optimize:clear || warn "Laravel cache clear gagal."; }
+    return 0
+}
+
+run_composer
+run_laravel
+cd "$H" 2>/dev/null || true
+
 # ---------------------------------------------------------------- Nginx conf
 MIME_LINE=""
 [ -f /etc/nginx/mime.types ] && MIME_LINE="include /etc/nginx/mime.types;"
@@ -126,7 +298,8 @@ ACCESS_LINE="access_log off;"
 [ "${NGINX_ACCESS_LOG:-0}" = "1" ] && ACCESS_LINE="access_log $H/logs/access.log;"
 
 sed -e "s#__HOME__#$H#g" \
-    -e "s#__PORT__#$PORT#g" \
+    -e "s#__ROOT__#$DOCROOT#g" \
+    -e "s#__PORT__#${PORT:-8080}#g" \
     -e "s#__MAXBODY__#$POST_MAX#g" \
     -e "s#__MIME__#$MIME_LINE#g" \
     -e "s#__ACCESSLOG__#$ACCESS_LINE#g" > "$H/nginx/nginx.conf" <<'EOF_NGINX'
@@ -171,8 +344,8 @@ http {
         listen __PORT__;
         server_name _;
 
-        root __HOME__/webroot/public;
-        index index.php index.html;
+        root __ROOT__;
+        index index.php index.html index.htm;
 
         add_header X-Content-Type-Options "nosniff" always;
         add_header X-Frame-Options "SAMEORIGIN" always;
@@ -185,8 +358,11 @@ http {
         location = /favicon.ico { access_log off; log_not_found off; }
         location = /robots.txt  { access_log off; log_not_found off; }
 
-        # File tersembunyi (.env, .git, dll) tidak boleh diakses
+        # File tersembunyi (.env, .git, dll) dan composer.json/lock tidak boleh diakses
         location ~ /\.(?!well-known) {
+            deny all;
+        }
+        location ~* ^/composer\.(json|lock)$ {
             deny all;
         }
 
@@ -227,248 +403,317 @@ http {
 }
 EOF_NGINX
 
-# ---------------------------------------------------------------- cek aplikasi Laravel
-[ -d "$H/webroot/public" ] || [ -n "${GIT_ADDRESS:-}" ] || fail "Folder webroot/public tidak ada. Upload project Laravel ke /home/container/webroot (atau isi Git Repo Address)."
+# Router cadangan untuk server bawaan PHP (dipakai kalau Nginx tidak bisa jalan)
+cat > "$H/php/router.php" <<'EOF_ROUTER'
+<?php
+// Cadangan "php -S" kalau Nginx gagal. Meniru: try_files $uri $uri/ /index.php
+$root = $_SERVER['DOCUMENT_ROOT'];
+$uri = rawurldecode((string) parse_url($_SERVER['REQUEST_URI'], PHP_URL_PATH));
+if (preg_match('#(^|/)\.(?!well-known)#', $uri) || preg_match('#^/composer\.(json|lock)$#', $uri)) {
+    http_response_code(403);
+    exit('Forbidden');
+}
+$file = $root . $uri;
+if ($uri !== '/' && is_file($file)) {
+    return false;
+}
+if (is_dir($file) && is_file(rtrim($file, '/') . '/index.php')) {
+    $dir = rtrim($file, '/');
+    $_SERVER['SCRIPT_NAME'] = rtrim($uri, '/') . '/index.php';
+    $_SERVER['SCRIPT_FILENAME'] = $dir . '/index.php';
+    chdir($dir);
+    require $dir . '/index.php';
+    return true;
+}
+$index = $root . '/index.php';
+if (is_file($index)) {
+    $_SERVER['SCRIPT_NAME'] = '/index.php';
+    $_SERVER['SCRIPT_FILENAME'] = $index;
+    chdir($root);
+    require $index;
+    return true;
+}
+http_response_code(404);
+echo 'Not Found';
+EOF_ROUTER
 
-# ---------------------------------------------------------------- Git (opsional)
-if [ -n "${GIT_ADDRESS:-}" ]; then
-    GIT_URL="${GIT_ADDRESS}"
-    case "$GIT_URL" in *.git) ;; *) GIT_URL="${GIT_URL}.git" ;; esac
-    ASKPASS="$H/.git-askpass"
-    if [ -n "${GIT_USERNAME:-}" ] || [ -n "${GIT_ACCESS_TOKEN:-}" ]; then
-        cat > "$ASKPASS" <<'EOF_ASKPASS'
-#!/bin/ash
-case "$1" in
-    *Username*) printf '%s\n' "${GIT_USERNAME:-}" ;;
-    *) printf '%s\n' "${GIT_ACCESS_TOKEN:-}" ;;
-esac
-EOF_ASKPASS
-        chmod 0700 "$ASKPASS"
-        export GIT_ASKPASS="$ASKPASS"
-        export GIT_TERMINAL_PROMPT=0
-    fi
-
-    if [ -d "$H/webroot/.git" ]; then
-        if [ "${GIT_AUTO_PULL:-0}" = "1" ]; then
-            log "Git auto-pull enabled (ff-only)."
-            git -C "$H/webroot" pull --ff-only || { rm -f "$ASKPASS"; fail "Git auto-pull failed."; }
-        fi
-    elif [ -z "$(ls -A "$H/webroot" 2>/dev/null)" ]; then
-        log "Cloning Laravel application repository..."
-        if [ -n "${GIT_BRANCH:-}" ]; then
-            git clone --depth 1 --single-branch --branch "$GIT_BRANCH" "$GIT_URL" "$H/webroot" || { rm -f "$ASKPASS"; fail "Git clone failed."; }
-        else
-            git clone --depth 1 "$GIT_URL" "$H/webroot" || { rm -f "$ASKPASS"; fail "Git clone failed."; }
-        fi
+# ---------------------------------------------------------------- tes konfigurasi, pilih mode web
+WEB_MODE="nginx"
+if [ "$WEB_OK" = "1" ]; then
+    if [ -z "$FPM_BIN" ] || [ -z "$NGINX_BIN" ]; then
+        WEB_MODE="builtin"
     else
-        warn "webroot already contains files and is not a Git repository; Git clone skipped."
+        log "Testing PHP-FPM configuration."
+        if ! "$FPM_BIN" -t -y "$H/php-fpm/php-fpm.conf" > "$H/logs/php-fpm-config-test.log" 2>&1; then
+            cat "$H/logs/php-fpm-config-test.log"
+            warn "Tes konfigurasi PHP-FPM gagal; memakai server bawaan PHP."
+            WEB_MODE="builtin"
+        fi
+        log "Testing Nginx configuration."
+        if ! "$NGINX_BIN" -t -e "$H/logs/nginx-error.log" -c "$H/nginx/nginx.conf" -p "$H/" > "$H/logs/nginx-config-test.log" 2>&1; then
+            cat "$H/logs/nginx-config-test.log"
+            warn "Tes konfigurasi Nginx gagal; memakai server bawaan PHP."
+            WEB_MODE="builtin"
+        fi
     fi
-    rm -f "$ASKPASS"
 fi
 
-[ -d "$H/webroot/public" ] || fail "Folder webroot/public tidak ada. Pastikan ini project Laravel."
-[ -f "$H/webroot/artisan" ] || fail "File artisan tidak ada di webroot. Egg ini khusus Laravel."
+# ---------------------------------------------------------------- fungsi start proses web
+FPM_LAST=0; WEB_LAST=0; WEB_FAILS=0; FPM_FAILS=0
 
-cd "$H/webroot"
+start_fpm() {
+    "$FPM_BIN" -F -y "$H/php-fpm/php-fpm.conf" > "$H/logs/php-fpm.out" 2>&1 &
+    FPM_PID=$!
+    FPM_LAST=$(date +%s)
+}
 
-# ---------------------------------------------------------------- Laravel bootstrap
-if [ "${CREATE_ENV_FILE:-1}" = "1" ] && [ ! -f .env ] && [ -f .env.example ]; then
-    log "Creating .env from .env.example."
-    cp .env.example .env
+start_web() {
+    if [ "$WEB_MODE" = "nginx" ]; then
+        "$NGINX_BIN" -e "$H/logs/nginx-error.log" -c "$H/nginx/nginx.conf" -p "$H/" > "$H/logs/nginx.out" 2>&1 &
+    else
+        PHP_CLI_SERVER_WORKERS="$FPM_CHILDREN" "$PHP_BIN" -S "0.0.0.0:${PORT}" -t "$DOCROOT" "$H/php/router.php" > "$H/logs/builtin.out" 2>&1 &
+    fi
+    WEB_PID=$!
+    WEB_LAST=$(date +%s)
+}
+
+if [ "$WEB_OK" = "1" ]; then
+    if [ "$WEB_MODE" = "nginx" ]; then
+        log "Starting PHP-FPM."
+        start_fpm
+        log "Starting Nginx on port ${PORT}."
+    else
+        log "Starting PHP built-in web server on port ${PORT}."
+    fi
+    start_web
+
+    # cek kesiapan di latar belakang (tidak menahan console)
+    if command -v curl >/dev/null 2>&1; then
+        (
+            i=0
+            while [ "$i" -lt 30 ]; do
+                CODE="$(curl -sS -o /dev/null -w '%{http_code}' --max-time 2 "http://127.0.0.1:${PORT}/" 2>/dev/null)"
+                case "$CODE" in
+                    1*|2*|3*|4*|5*) log "HTTP service is accepting requests on port ${PORT}."; exit 0 ;;
+                esac
+                sleep 1
+                i=$((i + 1))
+            done
+            warn "Web server belum menjawab di port ${PORT} setelah 30 detik."
+        ) &
+    fi
 fi
 
-if [ "${COMPOSER_AUTO_INSTALL:-1}" = "1" ] && [ -f composer.json ]; then
-    COMPOSER_MODE_VALUE="${COMPOSER_MODE:-install}"
-    case "$COMPOSER_MODE_VALUE" in
-        none) ;;
-        install)
-            if [ "${COMPOSER_FORCE_INSTALL:-0}" = "1" ] || [ ! -f vendor/autoload.php ]; then
-                log "Running Composer install."
-                if [ "${COMPOSER_NO_DEV:-1}" = "1" ]; then
-                    "$PHP_BIN" "$COMPOSER_BIN" install --no-interaction --prefer-dist --no-dev --optimize-autoloader || fail "Composer install failed."
-                else
-                    "$PHP_BIN" "$COMPOSER_BIN" install --no-interaction --prefer-dist --optimize-autoloader || fail "Composer install failed."
-                fi
-            fi
-            ;;
-        update)
-            log "Running Composer update (explicitly requested)."
-            if [ "${COMPOSER_NO_DEV:-1}" = "1" ]; then
-                "$PHP_BIN" "$COMPOSER_BIN" update --no-interaction --prefer-dist --no-dev --optimize-autoloader || fail "Composer update failed."
+# ---------------------------------------------------------------- queue worker & scheduler (Laravel saja)
+HAS_VENDOR=0
+[ -f "$WEBROOT/vendor/autoload.php" ] && HAS_VENDOR=1
+
+if [ "${QUEUE_WORKER_STATUS:-0}" = "1" ]; then
+    if [ "$IS_LARAVEL" = "1" ] && [ "$HAS_VENDOR" = "1" ] && [ -n "$PHP_BIN" ]; then
+        log "Starting Laravel queue worker."
+        (
+            cd "$WEBROOT" || exit 0
+            while true; do
+                "$PHP_BIN" artisan queue:work --sleep="${QUEUE_SLEEP:-3}" --tries="${QUEUE_TRIES:-3}" --timeout="${QUEUE_TIMEOUT:-90}" --no-interaction >>"$H/logs/queue.log" 2>&1
+                sleep 2
+            done
+        ) &
+        QUEUE_PID=$!
+    else
+        warn "Queue worker dilewati: ini bukan project Laravel atau vendor/ belum ada."
+    fi
+fi
+
+if [ "${SCHEDULER_STATUS:-0}" = "1" ]; then
+    if [ "$IS_LARAVEL" = "1" ] && [ "$HAS_VENDOR" = "1" ] && [ -n "$PHP_BIN" ]; then
+        log "Starting Laravel scheduler."
+        (
+            cd "$WEBROOT" || exit 0
+            while true; do
+                "$PHP_BIN" artisan schedule:run --no-interaction >>"$H/logs/scheduler.log" 2>&1
+                sleep 60
+            done
+        ) &
+        SCHED_PID=$!
+    else
+        warn "Scheduler dilewati: ini bukan project Laravel atau vendor/ belum ada."
+    fi
+fi
+
+# ---------------------------------------------------------------- Cloudflare Tunnel
+# CF_TUNNEL_STATUS=1: token kosong -> Quick Tunnel (domain trycloudflare otomatis), token diisi -> tunnel token.
+# Log: /home/container/cloudflare.log
+start_cloudflare() {
+    [ "${CF_TUNNEL_STATUS:-0}" = "1" ] || return 0
+    [ "$WEB_OK" = "1" ] || { warn "Cloudflare Tunnel dilewati: web server tidak berjalan."; return 0; }
+
+    # Semua (unduh + jalan) di latar belakang supaya start server & console tidak pernah tertahan.
+    (
+        CFLOG="$H/cloudflare.log"
+        CFBIN="$H/cloudflared"
+        token="${CF_TUNNEL_TOKEN:-}"
+        token="${token//[[:space:]]/}"
+
+        touch "$CFLOG" 2>/dev/null
+        if [ -f "$CFLOG" ] && [ "$(wc -c < "$CFLOG" 2>/dev/null || echo 0)" -gt 5242880 ]; then
+            : > "$CFLOG"
+        fi
+
+        if [ ! -x "$CFBIN" ]; then
+            log "cloudflared belum ada, mengunduh dari rilis resmi Cloudflare..."
+            case "$(uname -m)" in
+                x86_64|amd64) arch="amd64" ;;
+                aarch64|arm64) arch="arm64" ;;
+                *) arch="" ;;
+            esac
+            if [ -n "$arch" ] && curl -fsSL --retry 3 --connect-timeout 20 --max-time 180 \
+                    "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-${arch}" \
+                    -o "$CFBIN" >>"$CFLOG" 2>&1; then
+                chmod 0755 "$CFBIN"
+                "$CFBIN" version >>"$CFLOG" 2>&1 || rm -f "$CFBIN"
             else
-                "$PHP_BIN" "$COMPOSER_BIN" update --no-interaction --prefer-dist --optimize-autoloader || fail "Composer update failed."
+                rm -f "$CFBIN"
             fi
-            ;;
-        *) fail "COMPOSER_MODE must be install, update, or none." ;;
-    esac
-fi
+        fi
+        if [ ! -x "$CFBIN" ]; then
+            err "cloudflared tidak tersedia (unduh gagal). Detail di cloudflare.log. Server tetap berjalan tanpa tunnel."
+            exit 0
+        fi
 
-if [ -n "${COMPOSER_EXTRA_PACKAGES:-}" ] && [ "${COMPOSER_EXTRA_ON_START:-0}" = "1" ]; then
-    log "Installing extra Composer packages."
-    # tanpa tanda kutip supaya beberapa paket (dipisah spasi) terbaca satu per satu
-    "$PHP_BIN" "$COMPOSER_BIN" require ${COMPOSER_EXTRA_PACKAGES} --no-interaction || fail "Composer require failed."
-fi
+        if [ -n "$token" ]; then
+            log "Starting Cloudflare Tunnel (token). Log: cloudflare.log"
+        else
+            log "CF_TUNNEL_TOKEN kosong: memakai Quick Tunnel (domain trycloudflare.com otomatis). Log: cloudflare.log"
+        fi
 
-[ -f vendor/autoload.php ] || fail "vendor/autoload.php tidak ada. Upload folder vendor/ atau aktifkan Composer Auto Install (Composer Mode = install)."
-
-# APP_KEY dibuat SETELAH composer (artisan butuh vendor/)
-if [ "${GENERATE_APP_KEY:-1}" = "1" ] && [ -f .env ]; then
-    APP_KEY_VALUE="$(grep -E '^APP_KEY=' .env | head -n 1 | cut -d= -f2- || true)"
-    if [ -z "$APP_KEY_VALUE" ]; then
-        log "Generating Laravel APP_KEY."
-        "$PHP_BIN" artisan key:generate --force || fail "APP_KEY generation failed."
-    fi
-fi
-
-mkdir -p storage/framework/cache storage/framework/sessions storage/framework/views storage/logs bootstrap/cache
-chmod -R ug+rwX storage bootstrap/cache 2>/dev/null || true
-
-if [ "${RUN_STORAGE_LINK:-1}" = "1" ]; then
-    "$PHP_BIN" artisan storage:link --force || warn "storage:link failed (continuing)."
-fi
-
-if [ "${RUN_MIGRATIONS:-0}" = "1" ]; then
-    log "Running database migrations."
-    "$PHP_BIN" artisan migrate --force || fail "Database migration failed."
-fi
-
-if [ "${RUN_OPTIMIZE:-1}" = "1" ]; then
-    "$PHP_BIN" artisan optimize || warn "Laravel optimize failed (continuing)."
-fi
-
-if [ "${CLEAR_CACHES:-0}" = "1" ]; then
-    "$PHP_BIN" artisan optimize:clear || fail "Laravel cache clear failed."
-fi
-
-cd "$H"
-
-# ---------------------------------------------------------------- tes konfigurasi
-log "Testing PHP-FPM configuration."
-"$FPM_BIN" -t -y "$H/php-fpm/php-fpm.conf" > "$H/logs/php-fpm-config-test.log" 2>&1 || {
-    cat "$H/logs/php-fpm-config-test.log"
-    fail "PHP-FPM configuration test failed."
-}
-
-log "Testing Nginx configuration."
-"$NGINX_BIN" -t -e "$H/logs/nginx-error.log" -c "$H/nginx/nginx.conf" -p "$H/" > "$H/logs/nginx-config-test.log" 2>&1 || {
-    cat "$H/logs/nginx-config-test.log"
-    fail "Nginx configuration test failed."
-}
-
-# ---------------------------------------------------------------- jalankan service
-FPM_PID=""
-NGINX_PID=""
-QUEUE_PID=""
-SCHEDULER_PID=""
-CF_PID=""
-
-cleanup() {
-    set +e
-    for p in "$QUEUE_PID" "$SCHEDULER_PID" "$CF_PID" "$NGINX_PID" "$FPM_PID"; do
-        [ -n "$p" ] && kill -TERM "$p" 2>/dev/null
-    done
+        while true; do
+            off="$(wc -c < "$CFLOG" 2>/dev/null || echo 0)"
+            if [ -n "$token" ]; then
+                "$CFBIN" tunnel --no-autoupdate run --token "$token" >>"$CFLOG" 2>&1 &
+            else
+                "$CFBIN" tunnel --no-autoupdate --url "http://127.0.0.1:${PORT}" >>"$CFLOG" 2>&1 &
+            fi
+            cfpid=$!
+            if [ -z "$token" ]; then
+                n=0
+                while [ "$n" -lt 40 ]; do
+                    sleep 1
+                    url="$(tail -c +$((off + 1)) "$CFLOG" 2>/dev/null | grep -Eo 'https://[A-Za-z0-9.-]+\.trycloudflare\.com' | tail -n 1)"
+                    if [ -n "$url" ]; then
+                        echo "[Bimxyz] Cloudflare Quick Tunnel: $url"
+                        break
+                    fi
+                    kill -0 "$cfpid" 2>/dev/null || break
+                    n=$((n + 1))
+                done
+            fi
+            wait "$cfpid"
+            echo "[Bimxyz][WARNING] cloudflared berhenti; mencoba lagi dalam 5 detik (lihat cloudflare.log)."
+            sleep 5
+        done
+    ) &
+    CF_PID=$!
     return 0
 }
-trap 'exit 0' INT TERM
-trap cleanup EXIT
+start_cloudflare
 
-log "Starting PHP-FPM."
-"$FPM_BIN" -F -y "$H/php-fpm/php-fpm.conf" > "$H/logs/php-fpm.out" 2>&1 &
-FPM_PID=$!
+# ---------------------------------------------------------------- console interaktif (shell bash permanen)
+CONSOLE_FIFO="$H/tmp/console.fifo"
+rm -f "$CONSOLE_FIFO"
+CONSOLE_OK=0
+if mkfifo "$CONSOLE_FIFO" 2>/dev/null && exec 3<>"$CONSOLE_FIFO"; then
+    CONSOLE_OK=1
+else
+    warn "Console interaktif tidak bisa dibuat (mkfifo gagal)."
+fi
 
-log "Starting Nginx on port ${PORT}."
-"$NGINX_BIN" -e "$H/logs/nginx-error.log" -c "$H/nginx/nginx.conf" -p "$H/" > "$H/logs/nginx.out" 2>&1 &
-NGINX_PID=$!
+start_shell() {
+    ( cd "$H" 2>/dev/null; exec bash --norc --noprofile ) <&3 &
+    SH_PID=$!
+    printf 'artisan() { ( cd "%s/webroot" && php artisan "$@" ); }\n' "$H" >&3
+}
 
-# Tunggu sampai Nginx menjawab (dilewati kalau curl tidak ada)
-if command -v curl >/dev/null 2>&1; then
-    READY=0
-    i=0
-    while [ "$i" -lt 30 ]; do
-        CODE="$(curl -sS -o /dev/null -w '%{http_code}' --max-time 2 "http://127.0.0.1:${PORT}/" 2>/dev/null || true)"
-        case "$CODE" in
-            1*|2*|3*|4*|5*) READY=1; break ;;
-        esac
-        kill -0 "$NGINX_PID" 2>/dev/null || break
-        kill -0 "$FPM_PID" 2>/dev/null || break
-        sleep 1
-        i=$((i + 1))
-    done
-    if [ "$READY" = "1" ]; then
-        log "HTTP service is accepting requests on port ${PORT}."
-    elif kill -0 "$NGINX_PID" 2>/dev/null && kill -0 "$FPM_PID" 2>/dev/null; then
-        warn "Nginx did not answer on port ${PORT} within 30s (continuing)."
-    else
-        show_logs
-        fail "Nginx or PHP-FPM exited during startup."
+reset_shell() {
+    warn "Mereset shell console."
+    if [ -n "$SH_PID" ]; then
+        pkill -TERM -P "$SH_PID" 2>/dev/null
+        kill -TERM "$SH_PID" 2>/dev/null
     fi
-fi
-
-# ---------------------------------------------------------------- queue worker (opsional)
-if [ "${QUEUE_WORKER_STATUS:-0}" = "1" ]; then
-    log "Starting Laravel queue worker."
-    (
-        cd "$H/webroot"
-        while true; do
-            "$PHP_BIN" artisan queue:work --sleep="${QUEUE_SLEEP:-3}" --tries="${QUEUE_TRIES:-3}" --timeout="${QUEUE_TIMEOUT:-90}" --no-interaction >>"$H/logs/queue.log" 2>&1 || true
-            sleep 2
-        done
-    ) &
-    QUEUE_PID=$!
-fi
-
-# ---------------------------------------------------------------- scheduler (opsional)
-if [ "${SCHEDULER_STATUS:-0}" = "1" ]; then
-    log "Starting Laravel scheduler."
-    (
-        cd "$H/webroot"
-        while true; do
-            "$PHP_BIN" artisan schedule:run --no-interaction >>"$H/logs/scheduler.log" 2>&1 || true
-            sleep 60
-        done
-    ) &
-    SCHEDULER_PID=$!
-fi
-
-# ---------------------------------------------------------------- Cloudflare Tunnel (opsional)
-CF_MODE="${CF_TUNNEL_MODE:-off}"
-case "$CF_MODE" in
-    off) ;;
-    quick)
-        [ -x "$H/cloudflared" ] || fail "cloudflared is missing. Reinstall the server."
-        log "Starting Cloudflare Quick Tunnel."
-        (
-            while true; do
-                "$H/cloudflared" tunnel --no-autoupdate --url "http://127.0.0.1:${PORT}" >>"$H/logs/cloudflared.log" 2>&1 || true
-                sleep 5
-            done
-        ) &
-        CF_PID=$!
-        sleep 3
-        QUICK_URL="$(grep -Eo 'https://[A-Za-z0-9.-]+\.trycloudflare\.com' "$H/logs/cloudflared.log" 2>/dev/null | tail -n 1 || true)"
-        [ -n "$QUICK_URL" ] && log "Cloudflare Quick Tunnel: $QUICK_URL"
-        ;;
-    token)
-        [ -x "$H/cloudflared" ] || fail "cloudflared is missing. Reinstall the server."
-        [ -n "${CF_TUNNEL_TOKEN:-}" ] || fail "CF_TUNNEL_TOKEN is required for token mode."
-        log "Starting Cloudflare remotely-managed Tunnel."
-        (
-            while true; do
-                "$H/cloudflared" tunnel --no-autoupdate run --token "${CF_TUNNEL_TOKEN}" >>"$H/logs/cloudflared.log" 2>&1 || true
-                sleep 5
-            done
-        ) &
-        CF_PID=$!
-        ;;
-    *) fail "CF_TUNNEL_MODE must be off, quick, or token." ;;
-esac
-
-log "Laravel production stack is running."
-
-# ---------------------------------------------------------------- jaga proses
-while kill -0 "$FPM_PID" 2>/dev/null && kill -0 "$NGINX_PID" 2>/dev/null; do
     sleep 1
-done
+    start_shell
+}
 
-show_logs
-fail "PHP-FPM or Nginx stopped unexpectedly."
+start_forwarder() {
+    local main=$$
+    (
+        while IFS= read -r LINE; do
+            case "$LINE" in
+                '') ;;
+                .reset) kill -USR1 "$main" 2>/dev/null ;;
+                *) printf '%s\n' "$LINE" >&3 ;;
+            esac
+        done
+    ) <&4 &
+    FWD_PID=$!
+}
+
+if [ "$CONSOLE_OK" = "1" ]; then
+    start_shell
+    start_forwarder
+    log "Console aktif: ketik perintah bash apa saja (cd, ls, php, composer, artisan ...). Ketik .reset kalau ada perintah yang menggantung."
+fi
+
+if [ "$WEB_OK" = "1" ]; then
+    log "Server is running."
+else
+    log "Server is running (mode console saja; web server tidak aktif, lihat pesan ERROR di atas)."
+fi
+
+# ---------------------------------------------------------------- loop utama: console + pengawas (tidak pernah keluar)
+supervise() {
+    local now life
+    now=$(date +%s)
+
+    if [ "$WEB_OK" = "1" ]; then
+        # PHP-FPM
+        if [ "$WEB_MODE" = "nginx" ] && ! kill -0 "$FPM_PID" 2>/dev/null; then
+            if [ $((now - FPM_LAST)) -ge 5 ]; then
+                warn "PHP-FPM berhenti; menjalankan ulang."
+                show_logs
+                start_fpm
+            fi
+        fi
+        # web server (Nginx / bawaan PHP)
+        if ! kill -0 "$WEB_PID" 2>/dev/null; then
+            life=$((now - WEB_LAST))
+            local delay=$((WEB_FAILS * 3 + 3))
+            [ "$delay" -gt 30 ] && delay=30
+            if [ "$life" -ge "$delay" ]; then
+                if [ "$life" -lt 60 ]; then WEB_FAILS=$((WEB_FAILS + 1)); else WEB_FAILS=1; fi
+                warn "Web server ($WEB_MODE) berhenti; menjalankan ulang (gagal berturut-turut: $WEB_FAILS)."
+                show_logs
+                if [ "$WEB_MODE" = "nginx" ] && [ "$WEB_FAILS" -ge 3 ] && [ -n "$PHP_BIN" ]; then
+                    warn "Nginx terus gagal; pindah ke server bawaan PHP supaya website tetap hidup."
+                    WEB_MODE="builtin"
+                    WEB_FAILS=0
+                fi
+                start_web
+            fi
+        fi
+    fi
+
+    if [ "$CONSOLE_OK" = "1" ] && ! kill -0 "$SH_PID" 2>/dev/null; then
+        start_shell
+    fi
+    return 0
+}
+
+while true; do
+    if [ "$RESET_REQ" = "1" ]; then
+        RESET_REQ=0
+        [ "$CONSOLE_OK" = "1" ] && reset_shell
+    fi
+    supervise
+    sleep 1 &
+    wait $!
+done
