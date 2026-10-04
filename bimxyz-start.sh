@@ -8,6 +8,7 @@
 H=/home/container
 cd "$H" 2>/dev/null || true
 exec 4<&0
+stty -echo 2>/dev/null
 
 log()  { echo "[Bimxyz] $*"; }
 warn() { echo "[Bimxyz][WARNING] $*"; }
@@ -488,19 +489,23 @@ if [ "$WEB_OK" = "1" ]; then
     start_web
 
     # cek kesiapan di latar belakang (tidak menahan console)
+    rm -f "$H/tmp/.ready-check"
     if command -v curl >/dev/null 2>&1; then
         (
             i=0
             while [ "$i" -lt 30 ]; do
                 CODE="$(curl -sS -o /dev/null -w '%{http_code}' --max-time 2 "http://127.0.0.1:${PORT}/" 2>/dev/null)"
                 case "$CODE" in
-                    1*|2*|3*|4*|5*) log "HTTP service is accepting requests on port ${PORT}."; exit 0 ;;
+                    1*|2*|3*|4*|5*) log "HTTP service is accepting requests on port ${PORT}."; : > "$H/tmp/.ready-check"; exit 0 ;;
                 esac
                 sleep 1
                 i=$((i + 1))
             done
             warn "Web server belum menjawab di port ${PORT} setelah 30 detik."
+            : > "$H/tmp/.ready-check"
         ) &
+    else
+        : > "$H/tmp/.ready-check"
     fi
 fi
 
@@ -627,10 +632,29 @@ else
     warn "Console interaktif tidak bisa dibuat (mkfifo gagal)."
 fi
 
+# Fungsi yang dimuat ke shell console: helper artisan + prompt berwarna
+shell_init() {
+    printf 'artisan() { ( cd "%s/webroot" && php artisan "$@" ); }\n' "$H" >&3
+    cat >&3 <<'EOF_SHELLINIT'
+__bx_prompt() {
+    local rc=$? p="$PWD" st=""
+    case "$p" in
+        "$HOME") p="~" ;;
+        "$HOME"/*) p="~/${p#"$HOME"/}" ;;
+    esac
+    [ "$rc" -ne 0 ] && st=" $(printf '\033[1;31m✘ %s\033[0m' "$rc")"
+    printf '\n\033[1;35m╭─\033[0m \033[1;36m%s\033[0m\033[90m@\033[0m\033[1;34mbimxyz\033[0m \033[1;33m%s\033[0m%s\n\033[1;35m╰─❯\033[0m ' "${USER:-container}" "$p" "$st"
+}
+EOF_SHELLINIT
+}
+
 start_shell() {
+    # buang sisa input lama di fifo (mis. setelah 'exit') supaya tidak dibaca shell baru
+    while IFS= read -r -t 0.2 -u 3 _junk; do :; done
     ( cd "$H" 2>/dev/null; exec bash --norc --noprofile ) <&3 &
     SH_PID=$!
-    printf 'artisan() { ( cd "%s/webroot" && php artisan "$@" ); }\n' "$H" >&3
+    shell_init
+    [ "$1" = "prompt" ] && printf '__bx_prompt\n' >&3
 }
 
 reset_shell() {
@@ -640,17 +664,19 @@ reset_shell() {
         kill -TERM "$SH_PID" 2>/dev/null
     fi
     sleep 1
-    start_shell
+    start_shell prompt
 }
 
+# Pembaca stdin (console). Menampilkan perintah yang diketik di baris prompt, lalu meneruskannya ke shell.
 start_forwarder() {
     local main=$$
     (
         while IFS= read -r LINE; do
+            LINE="${LINE%$'\r'}"
             case "$LINE" in
-                '') ;;
-                .reset) kill -USR1 "$main" 2>/dev/null ;;
-                *) printf '%s\n' "$LINE" >&3 ;;
+                .reset) printf '\n'; kill -USR1 "$main" 2>/dev/null ;;
+                '') printf '\n'; printf '__bx_prompt\n' >&3 ;;
+                *) printf '%s\n' "$LINE"; printf '%s\n__bx_prompt\n' "$LINE" >&3 ;;
             esac
         done
     ) <&4 &
@@ -659,14 +685,26 @@ start_forwarder() {
 
 if [ "$CONSOLE_OK" = "1" ]; then
     start_shell
-    start_forwarder
     log "Console aktif: ketik perintah bash apa saja (cd, ls, php, composer, artisan ...). Ketik .reset kalau ada perintah yang menggantung."
 fi
+
+# Tunggu web siap (maks 10 detik) supaya pesan latar belakang tidak menyela baris prompt
+w=0
+while [ "$WEB_OK" = "1" ] && [ ! -e "$H/tmp/.ready-check" ] && [ "$w" -lt 50 ]; do
+    sleep 0.2
+    w=$((w + 1))
+done
 
 if [ "$WEB_OK" = "1" ]; then
     log "Server is running."
 else
     log "Server is running (mode console saja; web server tidak aktif, lihat pesan ERROR di atas)."
+fi
+
+# prompt pertama, lalu mulai membaca perintah dari console
+if [ "$CONSOLE_OK" = "1" ]; then
+    printf '__bx_prompt\n' >&3
+    start_forwarder
 fi
 
 # ---------------------------------------------------------------- loop utama: console + pengawas (tidak pernah keluar)
@@ -703,7 +741,7 @@ supervise() {
     fi
 
     if [ "$CONSOLE_OK" = "1" ] && ! kill -0 "$SH_PID" 2>/dev/null; then
-        start_shell
+        start_shell prompt
     fi
     return 0
 }
