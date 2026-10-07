@@ -1,0 +1,384 @@
+{
+    "_comment": "DO NOT EDIT: FILE GENERATED AUTOMATICALLY BY PTERODACTYL PANEL - PTERODACTYL.IO",
+    "meta": {
+        "version": "PTDL_v2",
+        "update_url": null
+    },
+    "exported_at": "2026-10-07T07:03:04+07:00",
+    "name": "PHP Web (Nginx + PHP-FPM) - Bimxyz Official",
+    "author": "bimxyzofficial@gmail.com",
+    "description": "Hosting PHP (Laravel maupun PHP biasa) dengan Nginx + PHP-FPM di atas image PHP resmi. File di \/home\/container\/webroot. Server tidak pernah berhenti sendiri walau ada error, console bisa dipakai mengetik perintah bash, Composer\/Git\/queue\/scheduler opsional, dan Cloudflare Tunnel dengan atau tanpa token. Image: ghcr.io\/bimxyzdev\/bimxyz-laravel.",
+    "features": [],
+    "docker_images": {
+        "PHP 8.4": "ghcr.io\/bimxyzdev\/bimxyz-laravel:8.4",
+        "PHP 8.3": "ghcr.io\/bimxyzdev\/bimxyz-laravel:8.3",
+        "PHP 8.2": "ghcr.io\/bimxyzdev\/bimxyz-laravel:8.2"
+    },
+    "file_denylist": [],
+    "startup": "bimxyz-start",
+    "config": {
+        "files": "{}",
+        "startup": "{\"done\": \"[Bimxyz] Server is running.\", \"userInteraction\": []}",
+        "logs": "{\"custom\":false,\"location\":\"logs\/latest.log\"}",
+        "stop": "^C"
+    },
+    "scripts": {
+        "installation": {
+            "script": "#!\/bin\/ash\n# Installer ringan: hanya menyiapkan folder + (opsional) cloudflared dari rilis resmi Cloudflare.\n# Tidak ada unduhan konfigurasi dari repo pihak ketiga. Gagal unduh cloudflared TIDAK menggagalkan install.\ncd \/mnt\/server || exit 1\nmkdir -p \/mnt\/server\/webroot \/mnt\/server\/logs \/mnt\/server\/tmp\n\necho \"[Bimxyz] Installing Cloudflare Tunnel client (optional)...\"\nCF_OK=1\nARCH=\"$(uname -m)\"\ncase \"$ARCH\" in\n    x86_64|amd64) CF_ARCH=\"amd64\" ;;\n    aarch64|arm64) CF_ARCH=\"arm64\" ;;\n    *) CF_ARCH=\"\"; CF_OK=0 ;;\nesac\nif [ \"$CF_OK\" = \"1\" ]; then\n    apk add --no-cache curl ca-certificates >\/dev\/null 2>&1 || true\n    curl -fL --retry 4 --retry-delay 2 --connect-timeout 20 \\\n        \"https:\/\/github.com\/cloudflare\/cloudflared\/releases\/latest\/download\/cloudflared-linux-${CF_ARCH}\" \\\n        -o \/mnt\/server\/cloudflared || CF_OK=0\nfi\nif [ \"$CF_OK\" = \"1\" ]; then\n    chmod 0755 \/mnt\/server\/cloudflared\n    \/mnt\/server\/cloudflared version >\/mnt\/server\/logs\/cloudflared-version.log 2>&1 || CF_OK=0\nfi\nif [ \"$CF_OK\" != \"1\" ]; then\n    rm -f \/mnt\/server\/cloudflared\n    echo \"[WARNING] cloudflared could not be installed. Laravel still works; Tunnel modes need a reinstall.\"\nfi\n\necho \"[SUCCESS] Laravel egg installation completed. Upload your Laravel project to \/home\/container\/webroot (or fill Git Repo Address).\"\nexit 0\n",
+            "container": "alpine:latest",
+            "entrypoint": "ash"
+        }
+    },
+    "variables": [
+        {
+            "name": "Git Repo Address",
+            "description": "Optional HTTPS Git repository. Used when webroot is empty, or for auto-pull when it is already a Git repository.",
+            "env_variable": "GIT_ADDRESS",
+            "default_value": "",
+            "user_viewable": true,
+            "user_editable": true,
+            "rules": "nullable|string|max:512",
+            "field_type": "text"
+        },
+        {
+            "name": "PHP-FPM Max Children",
+            "description": "Maximum simultaneous PHP-FPM workers. Default 5; tune to the server's RAM\/CPU limit.",
+            "env_variable": "PHP_FPM_MAX_CHILDREN",
+            "default_value": "5",
+            "user_viewable": true,
+            "user_editable": true,
+            "rules": "required|integer|min:1|max:100",
+            "field_type": "text"
+        },
+        {
+            "name": "Git Auto Pull",
+            "description": "1 = pull --ff-only on startup for an existing Git repository.",
+            "env_variable": "GIT_AUTO_PULL",
+            "default_value": "0",
+            "user_viewable": true,
+            "user_editable": true,
+            "rules": "required|boolean",
+            "field_type": "text"
+        },
+        {
+            "name": "Create .env",
+            "description": "Create .env from .env.example if .env does not exist.",
+            "env_variable": "CREATE_ENV_FILE",
+            "default_value": "1",
+            "user_viewable": true,
+            "user_editable": true,
+            "rules": "required|boolean",
+            "field_type": "text"
+        },
+        {
+            "name": "Generate APP_KEY",
+            "description": "Generate a key when APP_KEY is empty.",
+            "env_variable": "GENERATE_APP_KEY",
+            "default_value": "1",
+            "user_viewable": true,
+            "user_editable": true,
+            "rules": "required|boolean",
+            "field_type": "text"
+        },
+        {
+            "name": "Composer Auto Install",
+            "description": "Install Composer dependencies when vendor\/autoload.php is missing.",
+            "env_variable": "COMPOSER_AUTO_INSTALL",
+            "default_value": "1",
+            "user_viewable": true,
+            "user_editable": true,
+            "rules": "required|boolean",
+            "field_type": "text"
+        },
+        {
+            "name": "Composer No Dev",
+            "description": "1 = omit require-dev packages.",
+            "env_variable": "COMPOSER_NO_DEV",
+            "default_value": "1",
+            "user_viewable": true,
+            "user_editable": true,
+            "rules": "required|boolean",
+            "field_type": "text"
+        },
+        {
+            "name": "Force Composer Install",
+            "description": "1 = run composer install on every startup. Keep 0 for production.",
+            "env_variable": "COMPOSER_FORCE_INSTALL",
+            "default_value": "0",
+            "user_viewable": true,
+            "user_editable": true,
+            "rules": "required|boolean",
+            "field_type": "text"
+        },
+        {
+            "name": "Extra Composer Packages",
+            "description": "Optional packages for composer require. Space-separated.",
+            "env_variable": "COMPOSER_EXTRA_PACKAGES",
+            "default_value": "",
+            "user_viewable": true,
+            "user_editable": true,
+            "rules": "nullable|string|max:1024",
+            "field_type": "text"
+        },
+        {
+            "name": "Install Extra Composer On Start",
+            "description": "1 = run composer require for Extra Composer Packages on startup.",
+            "env_variable": "COMPOSER_EXTRA_ON_START",
+            "default_value": "0",
+            "user_viewable": true,
+            "user_editable": true,
+            "rules": "required|boolean",
+            "field_type": "text"
+        },
+        {
+            "name": "Storage Link",
+            "description": "Run php8 artisan storage:link --force.",
+            "env_variable": "RUN_STORAGE_LINK",
+            "default_value": "1",
+            "user_viewable": true,
+            "user_editable": true,
+            "rules": "required|boolean",
+            "field_type": "text"
+        },
+        {
+            "name": "Run Migrations",
+            "description": "1 = run php8 artisan migrate --force at startup.",
+            "env_variable": "RUN_MIGRATIONS",
+            "default_value": "0",
+            "user_viewable": true,
+            "user_editable": true,
+            "rules": "required|boolean",
+            "field_type": "text"
+        },
+        {
+            "name": "Laravel Optimize",
+            "description": "1 = run php8 artisan optimize at startup.",
+            "env_variable": "RUN_OPTIMIZE",
+            "default_value": "1",
+            "user_viewable": true,
+            "user_editable": true,
+            "rules": "required|boolean",
+            "field_type": "text"
+        },
+        {
+            "name": "Clear Laravel Caches",
+            "description": "1 = run optimize:clear before serving. Usually keep 0.",
+            "env_variable": "CLEAR_CACHES",
+            "default_value": "0",
+            "user_viewable": true,
+            "user_editable": true,
+            "rules": "required|boolean",
+            "field_type": "text"
+        },
+        {
+            "name": "OPcache",
+            "description": "Enable production OPcache settings when the image exposes the OPcache extension.",
+            "env_variable": "OPCACHE_STATUS",
+            "default_value": "1",
+            "user_viewable": true,
+            "user_editable": true,
+            "rules": "required|boolean",
+            "field_type": "text"
+        },
+        {
+            "name": "OPcache Memory MB",
+            "description": "OPcache shared memory size.",
+            "env_variable": "OPCACHE_MEMORY",
+            "default_value": "64",
+            "user_viewable": true,
+            "user_editable": true,
+            "rules": "required|integer|min:32|max:1024",
+            "field_type": "text"
+        },
+        {
+            "name": "OPcache Validate Timestamps",
+            "description": "1 = perubahan kode langsung terbaca (disarankan kalau file sering diupload\/diedit). 0 = sedikit lebih cepat, tapi server harus di-restart setelah kode berubah.",
+            "env_variable": "OPCACHE_VALIDATE_TIMESTAMPS",
+            "default_value": "1",
+            "user_viewable": true,
+            "user_editable": true,
+            "rules": "required|boolean",
+            "field_type": "text"
+        },
+        {
+            "name": "Queue Worker",
+            "description": "Start Laravel queue:work and restart it if the worker exits.",
+            "env_variable": "QUEUE_WORKER_STATUS",
+            "default_value": "0",
+            "user_viewable": true,
+            "user_editable": true,
+            "rules": "required|boolean",
+            "field_type": "text"
+        },
+        {
+            "name": "Queue Sleep",
+            "description": "Queue worker sleep interval in seconds.",
+            "env_variable": "QUEUE_SLEEP",
+            "default_value": "3",
+            "user_viewable": true,
+            "user_editable": true,
+            "rules": "required|integer|min:0|max:60",
+            "field_type": "text"
+        },
+        {
+            "name": "Queue Tries",
+            "description": "Queue worker attempts.",
+            "env_variable": "QUEUE_TRIES",
+            "default_value": "3",
+            "user_viewable": true,
+            "user_editable": true,
+            "rules": "required|integer|min:1|max:100",
+            "field_type": "text"
+        },
+        {
+            "name": "Queue Timeout",
+            "description": "Queue worker timeout in seconds.",
+            "env_variable": "QUEUE_TIMEOUT",
+            "default_value": "90",
+            "user_viewable": true,
+            "user_editable": true,
+            "rules": "required|integer|min:1|max:3600",
+            "field_type": "text"
+        },
+        {
+            "name": "Laravel Scheduler",
+            "description": "Run schedule:run once per minute.",
+            "env_variable": "SCHEDULER_STATUS",
+            "default_value": "0",
+            "user_viewable": true,
+            "user_editable": true,
+            "rules": "required|boolean",
+            "field_type": "text"
+        },
+        {
+            "name": "Cloudflare Tunnel Token (opsional)",
+            "description": "Kosongkan untuk Quick Tunnel otomatis. Isi token tunnel dari dashboard Cloudflare Zero Trust untuk domain sendiri. Hanya dipakai kalau Cloudflare Tunnel = 1.",
+            "env_variable": "CF_TUNNEL_TOKEN",
+            "default_value": "",
+            "user_viewable": true,
+            "user_editable": true,
+            "rules": "nullable|string|max:4096",
+            "field_type": "text"
+        },
+        {
+            "name": "Git Branch",
+            "description": "Optional branch name.",
+            "env_variable": "GIT_BRANCH",
+            "default_value": "",
+            "user_viewable": true,
+            "user_editable": true,
+            "rules": "nullable|string|max:128",
+            "field_type": "text"
+        },
+        {
+            "name": "Git Username",
+            "description": "Optional Git HTTPS username. Credentials are supplied through GIT_ASKPASS and are not written into the remote URL.",
+            "env_variable": "GIT_USERNAME",
+            "default_value": "",
+            "user_viewable": true,
+            "user_editable": true,
+            "rules": "nullable|string|max:256",
+            "field_type": "text"
+        },
+        {
+            "name": "Git Access Token",
+            "description": "Optional Git HTTPS access token.",
+            "env_variable": "GIT_ACCESS_TOKEN",
+            "default_value": "",
+            "user_viewable": true,
+            "user_editable": true,
+            "rules": "nullable|string|max:512",
+            "field_type": "text"
+        },
+        {
+            "name": "Composer Mode",
+            "description": "install = respect composer.lock; update = update dependencies; none = skip Composer.",
+            "env_variable": "COMPOSER_MODE",
+            "default_value": "install",
+            "user_viewable": true,
+            "user_editable": true,
+            "rules": "required|string|in:install,update,none",
+            "field_type": "text"
+        },
+        {
+            "name": "PHP Memory Limit",
+            "description": "PHP memory_limit.",
+            "env_variable": "PHP_MEMORY_LIMIT",
+            "default_value": "256M",
+            "user_viewable": true,
+            "user_editable": true,
+            "rules": "required|string|max:32",
+            "field_type": "text"
+        },
+        {
+            "name": "PHP Upload Max Filesize",
+            "description": "PHP upload_max_filesize.",
+            "env_variable": "PHP_UPLOAD_MAX_FILESIZE",
+            "default_value": "100M",
+            "user_viewable": true,
+            "user_editable": true,
+            "rules": "required|string|max:32",
+            "field_type": "text"
+        },
+        {
+            "name": "PHP Post Max Size",
+            "description": "PHP post_max_size.",
+            "env_variable": "PHP_POST_MAX_SIZE",
+            "default_value": "100M",
+            "user_viewable": true,
+            "user_editable": true,
+            "rules": "required|string|max:32",
+            "field_type": "text"
+        },
+        {
+            "name": "PHP Max Execution Time",
+            "description": "PHP max_execution_time in seconds.",
+            "env_variable": "PHP_MAX_EXECUTION_TIME",
+            "default_value": "120",
+            "user_viewable": true,
+            "user_editable": true,
+            "rules": "required|integer|min:30|max:3600",
+            "field_type": "text"
+        },
+        {
+            "name": "PHP Max Input Time",
+            "description": "PHP max_input_time in seconds.",
+            "env_variable": "PHP_MAX_INPUT_TIME",
+            "default_value": "120",
+            "user_viewable": true,
+            "user_editable": true,
+            "rules": "required|integer|min:30|max:3600",
+            "field_type": "text"
+        },
+        {
+            "name": "Nginx Access Log",
+            "description": "1 = tulis access log Nginx ke logs\/access.log (bisa membesar cepat). 0 = mati (default).",
+            "env_variable": "NGINX_ACCESS_LOG",
+            "default_value": "0",
+            "user_viewable": true,
+            "user_editable": true,
+            "rules": "required|boolean",
+            "field_type": "text"
+        },
+        {
+            "name": "Cloudflare Tunnel",
+            "description": "1 = aktifkan Cloudflare Tunnel. Kalau Token di bawah dikosongkan, otomatis memakai Quick Tunnel (domain trycloudflare.com muncul di console). Log ada di file cloudflare.log.",
+            "env_variable": "CF_TUNNEL_STATUS",
+            "default_value": "0",
+            "user_viewable": true,
+            "user_editable": true,
+            "rules": "required|boolean",
+            "field_type": "text"
+        },
+        {
+            "name": "Document Root Folder (opsional)",
+            "description": "Folder di dalam webroot yang dijadikan document root, misalnya public_html atau public. Kosongkan untuk otomatis (Laravel = public, PHP biasa = webroot).",
+            "env_variable": "DOCUMENT_ROOT_DIR",
+            "default_value": "",
+            "user_viewable": true,
+            "user_editable": true,
+            "rules": "nullable|string|max:100",
+            "field_type": "text"
+        }
+    ]
+}
