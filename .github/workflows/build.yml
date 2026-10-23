@@ -3,6 +3,8 @@ name: Build Laravel image
 on:
   push:
     branches: [main]
+  schedule:
+    - cron: "0 0 * * 1"
   workflow_dispatch:
 
 permissions:
@@ -32,6 +34,8 @@ jobs:
         with:
           context: .
           push: true
+          pull: true
+          no-cache: true
           build-args: |
             PHP_VERSION=${{ matrix.php }}
           tags: ${{ env.IMAGE }}:${{ matrix.php }}
