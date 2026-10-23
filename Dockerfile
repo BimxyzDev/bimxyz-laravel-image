@@ -36,6 +36,8 @@ RUN set -eux; \
     php -r 'foreach (["pdo_mysql","mysqli","gd","zip","intl","bcmath","mbstring","openssl","tokenizer","xml","ctype","fileinfo","curl","pcntl","exif","Zend OPcache"] as $e) { if (!extension_loaded($e)) { fwrite(STDERR, "extension hilang: $e\n"); exit(1); } }'; \
     test -x /sbin/tini
 
+RUN php -r '$m=["8.2"=>"8.2.35","8.3"=>"8.3.36","8.4"=>"8.4.27","8.5"=>"8.5.12"]; $b=PHP_MAJOR_VERSION.".".PHP_MINOR_VERSION; if(!isset($m[$b])||version_compare(PHP_VERSION,$m[$b],"<")){fwrite(STDERR,"PHP ".PHP_VERSION." belum ter-patch (CVE-2026-109618/109619)\n");exit(1);}'
+
 USER container
 ENV USER=container HOME=/home/container
 WORKDIR /home/container

@@ -69,11 +69,18 @@ FPM_START=2; FPM_MIN_SPARE=1; FPM_MAX_SPARE=3
 [ "$FPM_CHILDREN" -lt 2 ] && FPM_START="$FPM_CHILDREN"
 [ "$FPM_CHILDREN" -lt 3 ] && FPM_MAX_SPARE="$FPM_CHILDREN"
 
-POST_MAX="${PHP_POST_MAX_SIZE:-100M}"
-if ! echo "$POST_MAX" | grep -Eq '^[0-9]+[KMGkmg]?$'; then
-    warn "PHP_POST_MAX_SIZE tidak valid, memakai 100M."
-    POST_MAX=100M
-fi
+size_or() { if [[ "$1" =~ ^[0-9]+[KMGkmg]?$ ]]; then printf '%s' "$1"; else printf '%s' "$2"; fi; }
+mem_or()  { if [[ "$1" =~ ^(-1|[0-9]+[KMGkmg]?)$ ]]; then printf '%s' "$1"; else printf '%s' "$2"; fi; }
+num_or()  { if [[ "$1" =~ ^[0-9]+$ ]]; then printf '%s' "$1"; else printf '%s' "$2"; fi; }
+
+POST_MAX="$(size_or "${PHP_POST_MAX_SIZE:-100M}" 100M)"
+[ "$POST_MAX" = "${PHP_POST_MAX_SIZE:-100M}" ] || warn "PHP_POST_MAX_SIZE tidak valid, memakai 100M."
+PHP_MEM="$(mem_or "${PHP_MEMORY_LIMIT:-256M}" 256M)"
+PHP_UPLOAD="$(size_or "${PHP_UPLOAD_MAX_FILESIZE:-100M}" 100M)"
+PHP_EXEC="$(num_or "${PHP_MAX_EXECUTION_TIME:-120}" 120)"
+PHP_INTIME="$(num_or "${PHP_MAX_INPUT_TIME:-120}" 120)"
+OPC_MEM="$(num_or "${OPCACHE_MEMORY:-64}" 64)"
+OPC_TS="$(num_or "${OPCACHE_VALIDATE_TIMESTAMPS:-1}" 1)"
 
 [ -n "$PHP_BIN" ] && log "Using $("$PHP_BIN" -v 2>/dev/null | head -n 1)"
 
@@ -97,10 +104,13 @@ cat > "$H/php/conf.d/99-bimxyz.ini" <<EOF_PHP
 expose_php=Off
 display_errors=Off
 log_errors=On
-memory_limit=${PHP_MEMORY_LIMIT:-256M}
-max_execution_time=${PHP_MAX_EXECUTION_TIME:-120}
-max_input_time=${PHP_MAX_INPUT_TIME:-120}
-upload_max_filesize=${PHP_UPLOAD_MAX_FILESIZE:-100M}
+cgi.fix_pathinfo=0
+allow_url_include=Off
+session.upload_progress.enabled=0
+memory_limit=${PHP_MEM}
+max_execution_time=${PHP_EXEC}
+max_input_time=${PHP_INTIME}
+upload_max_filesize=${PHP_UPLOAD}
 post_max_size=${POST_MAX}
 sys_temp_dir=$H/tmp
 upload_tmp_dir=$H/tmp
@@ -113,10 +123,10 @@ if [ -n "$PHP_BIN" ] && [ "${OPCACHE_STATUS:-1}" = "1" ] && "$PHP_BIN" -m 2>/dev
     cat >> "$H/php/conf.d/99-bimxyz.ini" <<EOF_OPCACHE
 opcache.enable=1
 opcache.enable_cli=0
-opcache.memory_consumption=${OPCACHE_MEMORY:-64}
+opcache.memory_consumption=${OPC_MEM}
 opcache.interned_strings_buffer=16
 opcache.max_accelerated_files=20000
-opcache.validate_timestamps=${OPCACHE_VALIDATE_TIMESTAMPS:-1}
+opcache.validate_timestamps=${OPC_TS}
 opcache.revalidate_freq=2
 EOF_OPCACHE
 fi
@@ -142,42 +152,59 @@ catch_workers_output = yes
 decorate_workers_output = no
 php_admin_value[error_log] = $H/logs/php-error.log
 php_admin_flag[log_errors] = on
+php_admin_value[session.upload_progress.enabled] = 0
 EOF_FPM
 
 # ---------------------------------------------------------------- Git (opsional, tidak fatal)
 if [ -n "${GIT_ADDRESS:-}" ]; then
     GIT_URL="${GIT_ADDRESS}"
     case "$GIT_URL" in *.git) ;; *) GIT_URL="${GIT_URL}.git" ;; esac
-    ASKPASS="$H/.git-askpass"
-    if [ -n "${GIT_USERNAME:-}" ] || [ -n "${GIT_ACCESS_TOKEN:-}" ]; then
-        cat > "$ASKPASS" <<'EOF_ASKPASS'
+    GIT_URL_RE='^https://[A-Za-z0-9._~:/?#@!$&()*+,;=%-]+$'
+    GIT_BRANCH_RE='^[A-Za-z0-9][A-Za-z0-9._/-]*$'
+    GIT_BRANCH_VAL="${GIT_BRANCH:-}"
+    GIT_OK=1
+    if ! [[ "$GIT_URL" =~ $GIT_URL_RE ]]; then
+        warn "GIT_ADDRESS harus diawali https:// dan berisi karakter URL yang valid; Git dilewati."
+        GIT_OK=0
+    fi
+    if [ -n "$GIT_BRANCH_VAL" ] && ! [[ "$GIT_BRANCH_VAL" =~ $GIT_BRANCH_RE ]]; then
+        warn "GIT_BRANCH tidak valid; Git dilewati."
+        GIT_OK=0
+    fi
+
+    if [ "$GIT_OK" = "1" ]; then
+        export GIT_ALLOW_PROTOCOL=https GIT_TERMINAL_PROMPT=0 GIT_CONFIG_NOSYSTEM=1
+        GIT_SAFE=(-c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.sshCommand=/bin/false -c core.gitProxy= -c protocol.ext.allow=never -c protocol.file.allow=never)
+        ASKPASS="$H/.git-askpass"
+        if [ -n "${GIT_USERNAME:-}" ] || [ -n "${GIT_ACCESS_TOKEN:-}" ]; then
+            cat > "$ASKPASS" <<'EOF_ASKPASS'
 #!/bin/ash
 case "$1" in
     *Username*) printf '%s\n' "${GIT_USERNAME:-}" ;;
     *) printf '%s\n' "${GIT_ACCESS_TOKEN:-}" ;;
 esac
 EOF_ASKPASS
-        chmod 0700 "$ASKPASS"
-        export GIT_ASKPASS="$ASKPASS"
-        export GIT_TERMINAL_PROMPT=0
-    fi
+            chmod 0700 "$ASKPASS"
+            export GIT_ASKPASS="$ASKPASS"
+        fi
 
-    if [ -d "$WEBROOT/.git" ]; then
-        if [ "${GIT_AUTO_PULL:-0}" = "1" ]; then
-            log "Git auto-pull enabled (ff-only)."
-            git -C "$WEBROOT" pull --ff-only || warn "Git auto-pull gagal (lanjut dengan file yang ada)."
-        fi
-    elif [ -z "$(ls -A "$WEBROOT" 2>/dev/null)" ]; then
-        log "Cloning repository..."
-        if [ -n "${GIT_BRANCH:-}" ]; then
-            git clone --depth 1 --single-branch --branch "$GIT_BRANCH" "$GIT_URL" "$WEBROOT" || warn "Git clone gagal."
+        if [ -d "$WEBROOT/.git" ]; then
+            if [ "${GIT_AUTO_PULL:-0}" = "1" ]; then
+                log "Git auto-pull enabled (ff-only)."
+                git "${GIT_SAFE[@]}" -C "$WEBROOT" pull --ff-only || warn "Git auto-pull gagal (lanjut dengan file yang ada)."
+            fi
+        elif [ -z "$(ls -A "$WEBROOT" 2>/dev/null)" ]; then
+            log "Cloning repository..."
+            if [ -n "$GIT_BRANCH_VAL" ]; then
+                git "${GIT_SAFE[@]}" clone --depth 1 --single-branch --branch "$GIT_BRANCH_VAL" -- "$GIT_URL" "$WEBROOT" || warn "Git clone gagal."
+            else
+                git "${GIT_SAFE[@]}" clone --depth 1 -- "$GIT_URL" "$WEBROOT" || warn "Git clone gagal."
+            fi
         else
-            git clone --depth 1 "$GIT_URL" "$WEBROOT" || warn "Git clone gagal."
+            warn "webroot sudah berisi file dan bukan repo Git; clone dilewati."
         fi
-    else
-        warn "webroot sudah berisi file dan bukan repo Git; clone dilewati."
+        rm -f "$ASKPASS"
     fi
-    rm -f "$ASKPASS"
 fi
 
 # ---------------------------------------------------------------- halaman bawaan kalau webroot kosong
@@ -206,7 +233,7 @@ CUSTOM_ROOT="${DOCUMENT_ROOT_DIR:-}"
 CUSTOM_ROOT="${CUSTOM_ROOT#/}"
 CUSTOM_ROOT="${CUSTOM_ROOT%/}"
 if [ -n "$CUSTOM_ROOT" ]; then
-    if echo "$CUSTOM_ROOT" | grep -Eq '^[A-Za-z0-9_./-]+$' && [ "${CUSTOM_ROOT#*..}" = "$CUSTOM_ROOT" ] && [ -d "$WEBROOT/$CUSTOM_ROOT" ]; then
+    if [[ "$CUSTOM_ROOT" =~ ^[A-Za-z0-9_./-]+$ ]] && [[ "$CUSTOM_ROOT" != *..* ]] && [ -d "$WEBROOT/$CUSTOM_ROOT" ]; then
         DOCROOT="$WEBROOT/$CUSTOM_ROOT"
     else
         warn "DOCUMENT_ROOT_DIR '$CUSTOM_ROOT' tidak valid atau tidak ada; memakai pilihan otomatis."
@@ -245,8 +272,17 @@ run_composer() {
     esac
     if [ -n "${COMPOSER_EXTRA_PACKAGES:-}" ] && [ "${COMPOSER_EXTRA_ON_START:-0}" = "1" ]; then
         log "Installing extra Composer packages."
-        # tanpa tanda kutip: beberapa paket (dipisah spasi) terbaca satu per satu
-        "$PHP_BIN" "$COMPOSER_BIN" require ${COMPOSER_EXTRA_PACKAGES} --no-interaction || warn "Composer require gagal."
+        local CPK=() CPK_OK=1 cp
+        case "${COMPOSER_EXTRA_PACKAGES}" in *$'\n'*|*$'\r'*) CPK_OK=0 ;; esac
+        read -r -a CPK <<< "${COMPOSER_EXTRA_PACKAGES}"
+        for cp in "${CPK[@]}"; do
+            [[ "$cp" =~ ^[A-Za-z0-9][A-Za-z0-9._/:@^~*=+-]*$ ]] || CPK_OK=0
+        done
+        if [ "$CPK_OK" = "1" ] && [ "${#CPK[@]}" -gt 0 ]; then
+            "$PHP_BIN" "$COMPOSER_BIN" require --no-interaction -- "${CPK[@]}" || warn "Composer require gagal."
+        else
+            warn "COMPOSER_EXTRA_PACKAGES berisi karakter/opsi tidak valid; dilewati."
+        fi
     fi
     return 0
 }
@@ -367,6 +403,10 @@ http {
             deny all;
         }
 
+        location ~* ^/(storage|uploads?|files|media|attachments)/.*\.(php[0-9]?|phtml|phar|phps)$ {
+            deny all;
+        }
+
         location ~ \.php$ {
             try_files $uri =404;
             fastcgi_pass unix:__HOME__/tmp/php-fpm.sock;
@@ -411,6 +451,10 @@ cat > "$H/php/router.php" <<'EOF_ROUTER'
 $root = $_SERVER['DOCUMENT_ROOT'];
 $uri = rawurldecode((string) parse_url($_SERVER['REQUEST_URI'], PHP_URL_PATH));
 if (preg_match('#(^|/)\.(?!well-known)#', $uri) || preg_match('#^/composer\.(json|lock)$#', $uri)) {
+    http_response_code(403);
+    exit('Forbidden');
+}
+if (preg_match('#^/(storage|uploads?|files|media|attachments)/.*\.(php[0-9]?|phtml|phar|phps)$#i', $uri)) {
     http_response_code(403);
     exit('Forbidden');
 }
